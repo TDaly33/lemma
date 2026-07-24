@@ -19,6 +19,7 @@ pub struct GeneratorOptions {
     pub generate_stardict: bool,
     pub generate_epub3: bool,
     pub max_inflections: Option<usize>,
+    pub punct_variants: usize,
     pub front_matter_path: Option<PathBuf>,
 }
 
@@ -83,6 +84,7 @@ pub fn run(opts: GeneratorOptions) -> Result<(), Box<dyn std::error::Error>> {
         extraction_date: final_extraction_date.clone(),
         limit_percent: opts.limit_percent,
         max_inflections: opts.max_inflections,
+        punct_variants: opts.punct_variants,
         front_matter,
     };
 

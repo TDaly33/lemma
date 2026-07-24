@@ -1,3 +1,4 @@
+pub mod accent;
 pub mod declension;
 pub mod dilemma;
 pub mod downloader;
@@ -10,5 +11,6 @@ pub mod html_escape;
 pub mod html_gen;
 pub mod mobi;
 pub mod mobi_validator;
+pub mod punctuation;
 pub mod stardict;
 pub mod version;

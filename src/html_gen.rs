@@ -112,6 +112,10 @@ pub struct BuildParams {
     pub extraction_date: Option<String>,
     pub limit_percent: Option<f64>,
     pub max_inflections: Option<usize>,
+    /// Number of top-ranked inflected forms per headword (plus the headword
+    /// itself) that get trailing/leading punctuation `<idx:iform>` variants.
+    /// 0 disables Feature 2 entirely. See `entry_variations`.
+    pub punct_variants: usize,
     pub front_matter: Value,
 }
 
@@ -123,6 +127,14 @@ pub struct HtmlGenerator<'a> {
     frequency: FrequencyRanker,
     use_ranked_forms: bool,
     iform_owner: HashMap<String, String>,
+    // Per-headword enclitic double-accentuation variants (Feature 1),
+    // pre-resolved for collisions against real headwords and against other
+    // headwords' claims on the same string. Built by
+    // `build_double_accent_variants` before rendering starts.
+    double_accent_variants: HashMap<String, Vec<String>>,
+    // Running count of punctuation-attached iforms added (Feature 2),
+    // incremented from the parallel render pass in `entry_variations`.
+    punct_variants_added: std::sync::atomic::AtomicUsize,
     pub opf_filename: String,
     // Populated by create_content_html before any entry is rendered, so
     // linkify_definition can emit file-qualified cross-reference hrefs.
@@ -162,6 +174,8 @@ impl<'a> HtmlGenerator<'a> {
             frequency: freq,
             use_ranked_forms,
             iform_owner: HashMap::new(),
+            double_accent_variants: HashMap::new(),
+            punct_variants_added: std::sync::atomic::AtomicUsize::new(0),
             opf_filename: String::new(),
             headword_buckets: HashMap::new(),
             buckets_used: Vec::new(),
@@ -191,6 +205,7 @@ impl<'a> HtmlGenerator<'a> {
 
         self.merge_form_of_into_parents();
         self.build_iform_owners();
+        self.build_double_accent_variants();
 
         // Sort keys by normalized form
         let mut sorted_keys: Vec<String> = self.entries.keys().cloned().collect();
@@ -299,6 +314,24 @@ impl<'a> HtmlGenerator<'a> {
             "  Created {} content file(s) with {} entries total",
             self.buckets_used.len(),
             total_entries
+        );
+
+        if self.params.punct_variants > 0 {
+            println!(
+                "  Punctuation variants: added {} iform(s) (top {} ranked forms per headword)",
+                self.punct_variants_added.load(std::sync::atomic::Ordering::Relaxed),
+                self.params.punct_variants
+            );
+        }
+        let mut total_bytes: u64 = 0;
+        for &file in &self.buckets_used {
+            if let Ok(meta) = fs::metadata(self.output_dir.join(bucket_filename(file))) {
+                total_bytes += meta.len();
+            }
+        }
+        println!(
+            "  Total content size: {:.2} MB",
+            total_bytes as f64 / 1024.0 / 1024.0
         );
         Ok(())
     }
@@ -445,6 +478,124 @@ impl<'a> HtmlGenerator<'a> {
         self.iform_owner = iform_owner;
     }
 
+    /// Precompute enclitic double-accentuation variants (Feature 1): for each
+    /// headword and each of its generated inflected forms, if the form is
+    /// proparoxytone (see `crate::accent`), add the enclitic-attached
+    /// spelling (extra acute on the final syllable) as an index-only variant
+    /// of that same headword.
+    ///
+    /// Runs once, single-threaded-safe collision resolution, before the
+    /// parallel render pass so every headword sees the same final answer for
+    /// contested strings:
+    ///   - a candidate identical to an existing, distinct headword is
+    ///     dropped entirely (it already has its own real entry) and logged;
+    ///   - a candidate independently produced by more than one headword is
+    ///     awarded to the highest-frequency headword (alphabetical tiebreak),
+    ///     mirroring `build_iform_owners`'s existing contested-iform policy.
+    fn build_double_accent_variants(&mut self) {
+        // Each headword's own generated forms: itself plus every single-word
+        // inflection from its entries (the same "generated inflected forms"
+        // the rest of the pipeline works from, independent of the display
+        // cap applied later in entry_variations).
+        let per_word_forms: Vec<(String, Vec<String>)> = self
+            .entries
+            .iter()
+            .map(|(word, entries)| {
+                let mut forms: Vec<String> = vec![word.clone()];
+                let mut seen: HashSet<String> = HashSet::new();
+                seen.insert(word.clone());
+                for e in entries {
+                    for inf in &e.inflections {
+                        if !inf.contains(' ') && seen.insert(inf.clone()) {
+                            forms.push(inf.clone());
+                        }
+                    }
+                }
+                (word.clone(), forms)
+            })
+            .collect();
+
+        let per_word_candidates: Vec<(String, Vec<String>)> = per_word_forms
+            .par_iter()
+            .map(|(word, forms)| {
+                let mut seen: HashSet<String> = forms.iter().cloned().collect();
+                let mut cands = Vec::new();
+                for f in forms {
+                    if let Some(v) = crate::accent::enclitic_double_accent(f)
+                        && seen.insert(v.clone())
+                    {
+                        cands.push(v);
+                    }
+                }
+                (word.clone(), cands)
+            })
+            .collect();
+
+        let mut claims: HashMap<String, Vec<String>> = HashMap::new();
+        for (word, cands) in &per_word_candidates {
+            for c in cands {
+                claims.entry(c.clone()).or_default().push(word.clone());
+            }
+        }
+
+        let mut winner_for: HashMap<String, String> = HashMap::new();
+        let mut headword_collisions: Vec<String> = Vec::new();
+        let mut contested_resolved = 0usize;
+
+        for (cand, claimants) in &claims {
+            if self.entries.contains_key(cand) {
+                headword_collisions.push(cand.clone());
+                continue;
+            }
+            if claimants.len() == 1 {
+                winner_for.insert(cand.clone(), claimants[0].clone());
+                continue;
+            }
+            contested_resolved += 1;
+            let mut best = claimants[0].clone();
+            let mut best_f = self.frequency.frequency(&best);
+            for w in claimants.iter().skip(1) {
+                let f = self.frequency.frequency(w);
+                if f > best_f || (f == best_f && *w < best) {
+                    best = w.clone();
+                    best_f = f;
+                }
+            }
+            winner_for.insert(cand.clone(), best);
+        }
+
+        let mut result: HashMap<String, Vec<String>> = HashMap::new();
+        let mut total_added = 0usize;
+        for (word, cands) in per_word_candidates {
+            for c in cands {
+                if winner_for.get(&c).map(|w| w == &word).unwrap_or(false) {
+                    result.entry(word.clone()).or_default().push(c);
+                    total_added += 1;
+                }
+            }
+        }
+
+        if !headword_collisions.is_empty() {
+            let mut sample = headword_collisions.clone();
+            sample.sort();
+            let shown: Vec<&str> = sample.iter().take(10).map(|s| s.as_str()).collect();
+            println!(
+                "  Enclitic double-accent: skipped {} variant(s) colliding with an existing distinct headword (manual review): {}{}",
+                headword_collisions.len(),
+                shown.join(", "),
+                if headword_collisions.len() > 10 { ", ..." } else { "" }
+            );
+        }
+        println!(
+            "  Enclitic double-accent: added {} variant(s) across {} headword(s) ({} contested resolved by frequency)",
+            total_added,
+            result.len(),
+            contested_resolved
+        );
+
+        self.double_accent_variants = result;
+    }
+
     /// Compute the full ordered set of searchable inflected forms for a
     /// headword: ranked single-word inflections (capped at max_inflections),
     /// de-duplicated against iforms owned by a higher-frequency headword, then
@@ -486,6 +637,17 @@ impl<'a> HtmlGenerator<'a> {
             self.iform_owner.get(inf).map(|w| w.as_str() == word).unwrap_or(true)
         });
 
+        // Feature 2 scope (punctuation variants, see below): headword plus
+        // its top-N ranked inflections, captured here before polytonic
+        // expansion so punctuation is never applied to polytonic forms or to
+        // inflections beyond the ranked/capped set.
+        let punct_n = self.params.punct_variants;
+        let mut punct_source: Vec<String> = Vec::new();
+        if punct_n > 0 {
+            punct_source.push(word.to_string());
+            punct_source.extend(all_variations.iter().take(punct_n).cloned());
+        }
+
         // Polytonic expansion (always enabled in the unified edition).
         {
             let mut all_forms: Vec<String> = Vec::with_capacity(all_variations.len() + 1);
@@ -515,6 +677,36 @@ impl<'a> HtmlGenerator<'a> {
             }
             polytonic_forms.truncate(MAX_POLYTONIC);
             all_variations.extend(polytonic_forms);
+        }
+
+        // Feature 1: enclitic double-accentuation variants precomputed by
+        // `build_double_accent_variants`, already collision-resolved.
+        if let Some(extra) = self.double_accent_variants.get(word) {
+            let mut seen: HashSet<String> = all_variations.iter().cloned().collect();
+            for v in extra {
+                if seen.insert(v.clone()) {
+                    all_variations.push(v.clone());
+                }
+            }
+        }
+
+        // Feature 2: trailing/leading punctuation variants, scoped to
+        // `punct_source` (headword + top-N ranked inflections) computed
+        // above.
+        if punct_n > 0 {
+            let mut seen: HashSet<String> = all_variations.iter().cloned().collect();
+            let mut added = 0usize;
+            for form in &punct_source {
+                for v in crate::punctuation::variants_for(form) {
+                    if seen.insert(v.clone()) {
+                        all_variations.push(v);
+                        added += 1;
+                    }
+                }
+            }
+            if added > 0 {
+                self.punct_variants_added.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         all_variations
@@ -1479,4 +1671,117 @@ fn polytonic_variants(form: &str) -> Vec<String> {
     }
     results.remove(form);
     results.into_iter().collect()
+}
+
+#[cfg(test)]
+mod lookup_coverage_tests {
+    use super::*;
+    use crate::entry_processor::{Entry, EntryMap};
+
+    fn params(punct_variants: usize) -> BuildParams {
+        BuildParams {
+            source_lang: "el".to_string(),
+            build_date: "20260101".to_string(),
+            extraction_date: None,
+            limit_percent: None,
+            max_inflections: None,
+            punct_variants,
+            front_matter: serde_json::json!({}),
+        }
+    }
+
+    fn noun_entry(inflections: &[&str]) -> Entry {
+        Entry {
+            pos: "noun".to_string(),
+            inflections: inflections.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn entry_variations_includes_enclitic_double_accent() {
+        let mut entries = EntryMap::new();
+        entries.insert(
+            "χαρτοφύλακας".to_string(),
+            vec![noun_entry(&["χαρτοφύλακα", "χαρτοφύλακες"])],
+        );
+        let mut htmlgen = HtmlGenerator::new(entries, params(0), None);
+        htmlgen.merge_form_of_into_parents();
+        htmlgen.build_iform_owners();
+        htmlgen.build_double_accent_variants();
+
+        let entries_ref = htmlgen.entries.get(&"χαρτοφύλακας".to_string()).unwrap().clone();
+        let variations = htmlgen.entry_variations("χαρτοφύλακας", &entries_ref);
+
+        assert!(
+            variations.iter().any(|v| v == "χαρτοφύλακά"),
+            "expected enclitic double-accent variant, got {:?}",
+            variations
+        );
+    }
+
+    #[test]
+    fn entry_variations_includes_punctuation_variants_when_enabled() {
+        let mut entries = EntryMap::new();
+        entries.insert("λέξη".to_string(), vec![noun_entry(&[])]);
+        let mut htmlgen = HtmlGenerator::new(entries, params(5), None);
+        htmlgen.merge_form_of_into_parents();
+        htmlgen.build_iform_owners();
+        htmlgen.build_double_accent_variants();
+
+        let entries_ref = htmlgen.entries.get(&"λέξη".to_string()).unwrap().clone();
+        let variations = htmlgen.entry_variations("λέξη", &entries_ref);
+
+        for expected in ["λέξη,", "λέξη.", "«λέξη", "λέξη\u{0387}"] {
+            assert!(
+                variations.iter().any(|v| v == expected),
+                "expected {:?} in {:?}",
+                expected,
+                variations
+            );
+        }
+    }
+
+    #[test]
+    fn entry_variations_excludes_punctuation_variants_when_disabled() {
+        let mut entries = EntryMap::new();
+        entries.insert("λέξη".to_string(), vec![noun_entry(&[])]);
+        let mut htmlgen = HtmlGenerator::new(entries, params(0), None);
+        htmlgen.merge_form_of_into_parents();
+        htmlgen.build_iform_owners();
+        htmlgen.build_double_accent_variants();
+
+        let entries_ref = htmlgen.entries.get(&"λέξη".to_string()).unwrap().clone();
+        let variations = htmlgen.entry_variations("λέξη", &entries_ref);
+
+        assert!(!variations.iter().any(|v| v == "λέξη,"));
+    }
+
+    #[test]
+    fn double_accent_skips_collision_with_real_distinct_headword() {
+        // "χαρτοφύλακας" has the proparoxytone inflection "χαρτοφύλακα",
+        // whose enclitic double-accent transform is "χαρτοφύλακά". Here that
+        // exact string also exists as a real, separate dictionary headword -
+        // the variant must be dropped, not silently pointed at the wrong
+        // entry.
+        let mut entries = EntryMap::new();
+        entries.insert(
+            "χαρτοφύλακας".to_string(),
+            vec![noun_entry(&["χαρτοφύλακα"])],
+        );
+        entries.insert("χαρτοφύλακά".to_string(), vec![noun_entry(&[])]);
+
+        let mut htmlgen = HtmlGenerator::new(entries, params(0), None);
+        htmlgen.merge_form_of_into_parents();
+        htmlgen.build_iform_owners();
+        htmlgen.build_double_accent_variants();
+
+        assert!(
+            htmlgen.double_accent_variants
+                .get("χαρτοφύλακας")
+                .map(|v| !v.contains(&"χαρτοφύλακά".to_string()))
+                .unwrap_or(true),
+            "double-accent variant colliding with a real headword must be skipped"
+        );
+    }
 }

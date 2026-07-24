@@ -20,6 +20,12 @@ struct Cli {
     #[arg(short = 'i', long = "inflections")]
     inflections: Option<usize>,
 
+    /// Trailing/leading punctuation index variants: the headword plus its
+    /// top N frequency-ranked inflected forms each get punctuation-attached
+    /// `<idx:iform>` entries (e.g. "λέξη," -> λέξη). 0 disables.
+    #[arg(long = "punct-variants", default_value_t = 20)]
+    punct_variants: usize,
+
     /// Also generate .mobi via kindling (for sideloading).
     #[arg(short = 'm', long = "mobi", default_value_t = false)]
     mobi: bool,
@@ -64,6 +70,7 @@ fn main() {
         generate_stardict: cli.stardict,
         generate_epub3: cli.epub3,
         max_inflections: cli.inflections,
+        punct_variants: cli.punct_variants,
         front_matter_path: cli.front_matter,
     };
 
