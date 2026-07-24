@@ -22,8 +22,13 @@ struct Cli {
 
     /// Trailing/leading punctuation index variants: the headword plus its
     /// top N frequency-ranked inflected forms each get punctuation-attached
-    /// `<idx:iform>` entries (e.g. "λέξη," -> λέξη). 0 disables.
-    #[arg(long = "punct-variants", default_value_t = 20)]
+    /// `<idx:iform>` entries (e.g. "λέξη," -> λέξη). Default 1 (headword's
+    /// single most frequent inflection only) - measured against a real
+    /// ~31K-headword build to size the tradeoff before picking this
+    /// default; see the collision-resolution notes on `build_punct_variants`
+    /// in src/html_gen.rs for how cross-headword collisions are handled at
+    /// any N. 0 disables.
+    #[arg(long = "punct-variants", default_value_t = 1)]
     punct_variants: usize,
 
     /// Also generate .mobi via kindling (for sideloading).

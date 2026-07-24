@@ -33,6 +33,15 @@ const COLLISION_FIXTURE: &str = r#"{"word": "χαρτοφύλακας", "lang_co
 {"word": "χαρτοφύλακά", "lang_code": "el", "pos": "verb", "senses": [{"glosses": ["fictitious distinct headword, used only to test Feature 1 collision handling"]}], "forms": []}
 "#;
 
+// Punctuation-collision fixture: "καλά" is both its own headword (adverb)
+// and an inflected form of the separate headword "καλός" - ordinary Greek
+// syncretism, and exactly the real-data scenario that exposed Feature 2's
+// missing cross-headword collision resolution. Both independently want the
+// punctuation-attached candidate "καλά,".
+const PUNCT_COLLISION_FIXTURE: &str = r#"{"word": "καλά", "lang_code": "el", "pos": "adv", "senses": [{"glosses": ["well"]}], "forms": []}
+{"word": "καλός", "lang_code": "el", "pos": "adj", "senses": [{"glosses": ["good"]}], "forms": [{"form": "καλά", "tags": ["neuter", "plural"]}]}
+"#;
+
 struct Fixture {
     jsonl_path: PathBuf,
     output_dir: PathBuf,
@@ -151,6 +160,38 @@ fn double_accent_variant_never_shadows_a_real_distinct_headword() {
         iform_count, 0,
         "χαρτοφύλακά must not ALSO appear as an iform once it exists as a real headword"
     );
+}
+
+#[test]
+fn punct_variant_never_appears_under_two_different_headwords() {
+    // Regression guard for the collision bug found against the real
+    // dictionary: before the fix, "καλά," would be independently generated
+    // and emitted under BOTH <idx:entry id="hw_καλά"> and
+    // <idx:entry id="hw_καλός">, an ambiguous/undefined Kindle lookup. It
+    // must land under exactly one.
+    let (_fixture, html) = build_fixture_dictionary(PUNCT_COLLISION_FIXTURE, 5);
+
+    let kala_block = extract_entry_block(&html, "hw_καλά");
+    let kalos_block = extract_entry_block(&html, "hw_καλός");
+
+    let in_kala = kala_block.contains("<idx:iform value=\"καλά,\"");
+    let in_kalos = kalos_block.contains("<idx:iform value=\"καλά,\"");
+
+    assert!(
+        in_kala ^ in_kalos,
+        "\"καλά,\" must appear under exactly one entry: in_kala={}, in_kalos={}\nkala_block={}\nkalos_block={}",
+        in_kala,
+        in_kalos,
+        kala_block,
+        kalos_block
+    );
+}
+
+fn extract_entry_block<'a>(html: &'a str, entry_id: &str) -> &'a str {
+    let needle = format!("id=\"{}\"", entry_id);
+    let start = html.find(&needle).expect("entry should exist");
+    let end = html[start..].find("</idx:entry>").expect("entry should close") + start;
+    &html[start..end]
 }
 
 #[test]

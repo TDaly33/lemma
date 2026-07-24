@@ -132,9 +132,10 @@ pub struct HtmlGenerator<'a> {
     // headwords' claims on the same string. Built by
     // `build_double_accent_variants` before rendering starts.
     double_accent_variants: HashMap<String, Vec<String>>,
-    // Running count of punctuation-attached iforms added (Feature 2),
-    // incremented from the parallel render pass in `entry_variations`.
-    punct_variants_added: std::sync::atomic::AtomicUsize,
+    // Per-headword punctuation-attached variants (Feature 2), pre-resolved
+    // for cross-headword collisions the same way as Feature 1. Built by
+    // `build_punct_variants` before rendering starts.
+    punct_variants_map: HashMap<String, Vec<String>>,
     pub opf_filename: String,
     // Populated by create_content_html before any entry is rendered, so
     // linkify_definition can emit file-qualified cross-reference hrefs.
@@ -175,7 +176,7 @@ impl<'a> HtmlGenerator<'a> {
             use_ranked_forms,
             iform_owner: HashMap::new(),
             double_accent_variants: HashMap::new(),
-            punct_variants_added: std::sync::atomic::AtomicUsize::new(0),
+            punct_variants_map: HashMap::new(),
             opf_filename: String::new(),
             headword_buckets: HashMap::new(),
             buckets_used: Vec::new(),
@@ -206,6 +207,7 @@ impl<'a> HtmlGenerator<'a> {
         self.merge_form_of_into_parents();
         self.build_iform_owners();
         self.build_double_accent_variants();
+        self.build_punct_variants();
 
         // Sort keys by normalized form
         let mut sorted_keys: Vec<String> = self.entries.keys().cloned().collect();
@@ -316,13 +318,6 @@ impl<'a> HtmlGenerator<'a> {
             total_entries
         );
 
-        if self.params.punct_variants > 0 {
-            println!(
-                "  Punctuation variants: added {} iform(s) (top {} ranked forms per headword)",
-                self.punct_variants_added.load(std::sync::atomic::Ordering::Relaxed),
-                self.params.punct_variants
-            );
-        }
         let mut total_bytes: u64 = 0;
         for &file in &self.buckets_used {
             if let Ok(meta) = fs::metadata(self.output_dir.join(bucket_filename(file))) {
@@ -596,13 +591,127 @@ impl<'a> HtmlGenerator<'a> {
         self.double_accent_variants = result;
     }
 
-    /// Compute the full ordered set of searchable inflected forms for a
-    /// headword: ranked single-word inflections (capped at max_inflections),
-    /// de-duplicated against iforms owned by a higher-frequency headword, then
-    /// extended with polytonic variants. This is exactly the set emitted as
-    /// `<idx:iform>` by the idx path and as `<match>` entries by the EPUB3 SKM,
-    /// keeping the two outputs in agreement.
-    fn entry_variations(&self, word: &str, entries: &[Entry]) -> Vec<String> {
+    /// Precompute punctuation-attached variants (Feature 2): for each
+    /// headword, the headword itself plus its top `punct_variants` ranked
+    /// inflections each get trailing/leading punctuation forms. Resolved for
+    /// cross-headword collisions dictionary-wide, before rendering starts -
+    /// the same pattern as `build_double_accent_variants`, and for the same
+    /// reason: two different headwords can independently produce the exact
+    /// same punctuated string (e.g. both have a top-ranked form "λέξη"), and
+    /// without this pass that collision was previously resolved arbitrarily
+    /// by whatever kindling's INDX builder happened to keep last, with no
+    /// tiebreak and no visibility into how often it occurred.
+    fn build_punct_variants(&mut self) {
+        let punct_n = self.params.punct_variants;
+        if punct_n == 0 {
+            self.punct_variants_map = HashMap::new();
+            return;
+        }
+
+        // headword + its top-N ranked inflections (pre-polytonic, matching
+        // Feature 2's original scoping) for every headword.
+        let per_word_sources: Vec<(String, Vec<String>)> = self
+            .entries
+            .iter()
+            .map(|(word, entries)| {
+                let ranked = self.ranked_variations(word, entries);
+                let mut source = Vec::with_capacity(punct_n + 1);
+                source.push(word.clone());
+                source.extend(ranked.into_iter().take(punct_n));
+                (word.clone(), source)
+            })
+            .collect();
+
+        let per_word_candidates: Vec<(String, Vec<String>)> = per_word_sources
+            .par_iter()
+            .map(|(word, source)| {
+                let mut seen: HashSet<String> = HashSet::new();
+                let mut cands = Vec::new();
+                for form in source {
+                    for v in crate::punctuation::variants_for(form) {
+                        if seen.insert(v.clone()) {
+                            cands.push(v);
+                        }
+                    }
+                }
+                (word.clone(), cands)
+            })
+            .collect();
+
+        let mut claims: HashMap<String, Vec<String>> = HashMap::new();
+        for (word, cands) in &per_word_candidates {
+            for c in cands {
+                claims.entry(c.clone()).or_default().push(word.clone());
+            }
+        }
+
+        let mut winner_for: HashMap<String, String> = HashMap::new();
+        let mut headword_collisions: Vec<String> = Vec::new();
+        let mut contested_resolved = 0usize;
+
+        for (cand, claimants) in &claims {
+            if self.entries.contains_key(cand) {
+                headword_collisions.push(cand.clone());
+                continue;
+            }
+            if claimants.len() == 1 {
+                winner_for.insert(cand.clone(), claimants[0].clone());
+                continue;
+            }
+            contested_resolved += 1;
+            let mut best = claimants[0].clone();
+            let mut best_f = self.frequency.frequency(&best);
+            for w in claimants.iter().skip(1) {
+                let f = self.frequency.frequency(w);
+                if f > best_f || (f == best_f && *w < best) {
+                    best = w.clone();
+                    best_f = f;
+                }
+            }
+            winner_for.insert(cand.clone(), best);
+        }
+
+        let mut result: HashMap<String, Vec<String>> = HashMap::new();
+        let mut total_added = 0usize;
+        for (word, cands) in per_word_candidates {
+            for c in cands {
+                if winner_for.get(&c).map(|w| w == &word).unwrap_or(false) {
+                    result.entry(word.clone()).or_default().push(c);
+                    total_added += 1;
+                }
+            }
+        }
+
+        if !headword_collisions.is_empty() {
+            let mut sample = headword_collisions.clone();
+            sample.sort();
+            let shown: Vec<&str> = sample.iter().take(10).map(|s| s.as_str()).collect();
+            println!(
+                "  Punctuation variants: skipped {} variant(s) colliding with an existing distinct headword (manual review): {}{}",
+                headword_collisions.len(),
+                shown.join(", "),
+                if headword_collisions.len() > 10 { ", ..." } else { "" }
+            );
+        }
+        println!(
+            "  Punctuation variants: added {} variant(s) across {} headword(s) ({} contested resolved by frequency, top {} ranked forms per headword)",
+            total_added,
+            result.len(),
+            contested_resolved,
+            punct_n
+        );
+
+        self.punct_variants_map = result;
+    }
+
+    /// Ranked single-word inflections for a headword, capped at
+    /// `max_inflections` and de-duplicated against iforms owned by a
+    /// higher-frequency headword. Shared by `entry_variations` (which
+    /// extends this with polytonic/Feature-1/Feature-2 additions) and the
+    /// upfront Feature 2 collision-resolution pass, which needs the same
+    /// ranked/capped list to determine each headword's punctuation scope
+    /// before any entry is rendered.
+    fn ranked_variations(&self, word: &str, entries: &[Entry]) -> Vec<String> {
         let max_inflections = self.params.max_inflections.unwrap_or(MAX_INFLECTIONS);
 
         // Combine all inflections from all entries
@@ -637,16 +746,17 @@ impl<'a> HtmlGenerator<'a> {
             self.iform_owner.get(inf).map(|w| w.as_str() == word).unwrap_or(true)
         });
 
-        // Feature 2 scope (punctuation variants, see below): headword plus
-        // its top-N ranked inflections, captured here before polytonic
-        // expansion so punctuation is never applied to polytonic forms or to
-        // inflections beyond the ranked/capped set.
-        let punct_n = self.params.punct_variants;
-        let mut punct_source: Vec<String> = Vec::new();
-        if punct_n > 0 {
-            punct_source.push(word.to_string());
-            punct_source.extend(all_variations.iter().take(punct_n).cloned());
-        }
+        all_variations
+    }
+
+    /// Compute the full ordered set of searchable inflected forms for a
+    /// headword: ranked single-word inflections (capped at max_inflections),
+    /// de-duplicated against iforms owned by a higher-frequency headword, then
+    /// extended with polytonic variants. This is exactly the set emitted as
+    /// `<idx:iform>` by the idx path and as `<match>` entries by the EPUB3 SKM,
+    /// keeping the two outputs in agreement.
+    fn entry_variations(&self, word: &str, entries: &[Entry]) -> Vec<String> {
+        let mut all_variations = self.ranked_variations(word, entries);
 
         // Polytonic expansion (always enabled in the unified edition).
         {
@@ -690,22 +800,14 @@ impl<'a> HtmlGenerator<'a> {
             }
         }
 
-        // Feature 2: trailing/leading punctuation variants, scoped to
-        // `punct_source` (headword + top-N ranked inflections) computed
-        // above.
-        if punct_n > 0 {
+        // Feature 2: trailing/leading punctuation variants precomputed by
+        // `build_punct_variants`, already collision-resolved.
+        if let Some(extra) = self.punct_variants_map.get(word) {
             let mut seen: HashSet<String> = all_variations.iter().cloned().collect();
-            let mut added = 0usize;
-            for form in &punct_source {
-                for v in crate::punctuation::variants_for(form) {
-                    if seen.insert(v.clone()) {
-                        all_variations.push(v);
-                        added += 1;
-                    }
+            for v in extra {
+                if seen.insert(v.clone()) {
+                    all_variations.push(v.clone());
                 }
-            }
-            if added > 0 {
-                self.punct_variants_added.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -1709,6 +1811,7 @@ mod lookup_coverage_tests {
         htmlgen.merge_form_of_into_parents();
         htmlgen.build_iform_owners();
         htmlgen.build_double_accent_variants();
+        htmlgen.build_punct_variants();
 
         let entries_ref = htmlgen.entries.get(&"χαρτοφύλακας".to_string()).unwrap().clone();
         let variations = htmlgen.entry_variations("χαρτοφύλακας", &entries_ref);
@@ -1728,6 +1831,7 @@ mod lookup_coverage_tests {
         htmlgen.merge_form_of_into_parents();
         htmlgen.build_iform_owners();
         htmlgen.build_double_accent_variants();
+        htmlgen.build_punct_variants();
 
         let entries_ref = htmlgen.entries.get(&"λέξη".to_string()).unwrap().clone();
         let variations = htmlgen.entry_variations("λέξη", &entries_ref);
@@ -1750,6 +1854,7 @@ mod lookup_coverage_tests {
         htmlgen.merge_form_of_into_parents();
         htmlgen.build_iform_owners();
         htmlgen.build_double_accent_variants();
+        htmlgen.build_punct_variants();
 
         let entries_ref = htmlgen.entries.get(&"λέξη".to_string()).unwrap().clone();
         let variations = htmlgen.entry_variations("λέξη", &entries_ref);
@@ -1775,6 +1880,7 @@ mod lookup_coverage_tests {
         htmlgen.merge_form_of_into_parents();
         htmlgen.build_iform_owners();
         htmlgen.build_double_accent_variants();
+        htmlgen.build_punct_variants();
 
         assert!(
             htmlgen.double_accent_variants
@@ -1782,6 +1888,44 @@ mod lookup_coverage_tests {
                 .map(|v| !v.contains(&"χαρτοφύλακά".to_string()))
                 .unwrap_or(true),
             "double-accent variant colliding with a real headword must be skipped"
+        );
+    }
+
+    #[test]
+    fn punct_variants_resolve_cross_headword_collision_by_frequency() {
+        // "καλά" is both a headword (adverb) and an inflected form of
+        // "καλός" (neuter plural adjective) - ordinary Greek syncretism.
+        // Both independently produce the punctuation-attached candidate
+        // "καλά," at N>0. Without cross-headword resolution (the bug this
+        // test guards against), the same string would end up emitted under
+        // BOTH headwords' <idx:infl> blocks, an ambiguous/undefined lookup
+        // for Kindle. It must land on exactly one.
+        let mut entries = EntryMap::new();
+        entries.insert("καλά".to_string(), vec![noun_entry(&[])]);
+        entries.insert("καλός".to_string(), vec![noun_entry(&["καλά"])]);
+
+        let mut htmlgen = HtmlGenerator::new(entries, params(5), None);
+        htmlgen.merge_form_of_into_parents();
+        htmlgen.build_iform_owners();
+        htmlgen.build_double_accent_variants();
+        htmlgen.build_punct_variants();
+
+        let owns_from_kala = htmlgen
+            .punct_variants_map
+            .get("καλά")
+            .map(|v| v.contains(&"καλά,".to_string()))
+            .unwrap_or(false);
+        let owns_from_kalos = htmlgen
+            .punct_variants_map
+            .get("καλός")
+            .map(|v| v.contains(&"καλά,".to_string()))
+            .unwrap_or(false);
+
+        assert!(
+            owns_from_kala ^ owns_from_kalos,
+            "\"καλά,\" must be claimed by exactly one of the two colliding headwords: from_kala={}, from_kalos={}",
+            owns_from_kala,
+            owns_from_kalos
         );
     }
 }
