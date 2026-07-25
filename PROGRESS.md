@@ -64,7 +64,7 @@ Branch: `claude/lemma-lookup-coverage-kddi2k`
   pending — awaiting the user's physical-device test).
 
 Commits: `f4a609c`, `c9a50a6`, `13d90ad`, `345b060`, `08a575c`, `63a7298`,
-`<pending — this session's capitalized-variants commit>`.
+`33f9ebd`.
 
 ## Known, deliberately out-of-scope
 
