@@ -99,6 +99,27 @@ fn acute_to_circumflex() -> &'static HashMap<char, char> {
     })
 }
 
+// Accented-capital vowel -> bare-capital vowel, for dropping the tonos on a
+// capitalized initial letter (Greek typesetting convention). Only the seven
+// monotonic acute-accented capitals are relevant here - capitalize_first()
+// (Rust's char::to_uppercase()) never produces anything else as the first
+// character of a capitalized monotonic Greek word.
+fn drop_tonos_from_capital(capitalized: &str) -> Option<String> {
+    let mut chars = capitalized.chars();
+    let first = chars.next()?;
+    let bare = match first {
+        'Ά' => 'Α',
+        'Έ' => 'Ε',
+        'Ή' => 'Η',
+        'Ί' => 'Ι',
+        'Ό' => 'Ο',
+        'Ύ' => 'Υ',
+        'Ώ' => 'Ω',
+        _ => return None,
+    };
+    Some(format!("{}{}", bare, chars.as_str()))
+}
+
 const DIPHTHONG_FIRSTS: &str = "αεοΑΕΟ";
 const DIPHTHONG_SECONDS: &str = "ιυίύΙΥΊΎ";
 
@@ -136,6 +157,14 @@ pub struct HtmlGenerator<'a> {
     // for cross-headword collisions the same way as Feature 1. Built by
     // `build_punct_variants` before rendering starts.
     punct_variants_map: HashMap<String, Vec<String>>,
+    // Per-headword explicit capitalized variants, pre-resolved for
+    // cross-headword collisions the same way as Feature 1/2. Built by
+    // `build_capitalized_variants` before rendering starts. Replaces the old
+    // forms-array-gated capitalize_first() calls in entry_processor.rs -
+    // this pass is unconditional on headword + every inflection, closing the
+    // indeclinable-word capitalization gap (Όχι, Μα, Έτσι, ...) as a side
+    // effect.
+    capitalized_variants: HashMap<String, Vec<String>>,
     pub opf_filename: String,
     // Populated by create_content_html before any entry is rendered, so
     // linkify_definition can emit file-qualified cross-reference hrefs.
@@ -177,6 +206,7 @@ impl<'a> HtmlGenerator<'a> {
             iform_owner: HashMap::new(),
             double_accent_variants: HashMap::new(),
             punct_variants_map: HashMap::new(),
+            capitalized_variants: HashMap::new(),
             opf_filename: String::new(),
             headword_buckets: HashMap::new(),
             buckets_used: Vec::new(),
@@ -208,6 +238,7 @@ impl<'a> HtmlGenerator<'a> {
         self.build_iform_owners();
         self.build_double_accent_variants();
         self.build_punct_variants();
+        self.build_capitalized_variants();
 
         // Sort keys by normalized form
         let mut sorted_keys: Vec<String> = self.entries.keys().cloned().collect();
@@ -713,6 +744,138 @@ impl<'a> HtmlGenerator<'a> {
         self.punct_variants_map = result;
     }
 
+    /// Explicit capitalized-form variants: for every headword and every one
+    /// of its generated inflections that doesn't already start with an
+    /// uppercase letter, index up to two capitalized forms.
+    ///
+    /// 1. Accent-preserving capital (`capitalize_first`, Rust's
+    ///    `char::to_uppercase()`): έδειχναν -> Έδειχναν.
+    /// 2. Accent-dropped-on-first-letter capital, only when the
+    ///    accent-preserving capital's first letter actually carries a tonos
+    ///    (Ά/Έ/Ή/Ί/Ό/Ύ/Ώ -> Α/Ε/Η/Ι/Ο/Υ/Ω), matching the Greek typesetting
+    ///    convention of dropping the accent on a capitalized initial letter:
+    ///    έδειχναν -> Εδειχναν.
+    ///
+    /// Replaces the old capitalize_first()/lower_first() calls that used to
+    /// live inside entry_processor.rs's loop over the raw Wiktionary `forms`
+    /// array (gated on that array being non-empty). Being unconditional on
+    /// headword + every inflection instead closes the indeclinable-word gap
+    /// (Όχι, Μα, Έτσι, ...) as a side effect - those words have an empty
+    /// `forms` array, so the old logic never produced a capitalized variant
+    /// for them at all.
+    ///
+    /// Dictionary-wide collision resolution mirrors Feature 1/Feature 2
+    /// exactly: a candidate colliding with a real distinct headword is
+    /// dropped and logged; a candidate independently produced by two
+    /// headwords is resolved by frequency (alphabetical tiebreak).
+    fn build_capitalized_variants(&mut self) {
+        let per_word_forms: Vec<(String, Vec<String>)> = self
+            .entries
+            .iter()
+            .map(|(word, entries)| {
+                let mut forms: Vec<String> = vec![word.clone()];
+                let mut seen: HashSet<String> = HashSet::new();
+                seen.insert(word.clone());
+                for e in entries {
+                    for inf in &e.inflections {
+                        if !inf.contains(' ') && seen.insert(inf.clone()) {
+                            forms.push(inf.clone());
+                        }
+                    }
+                }
+                (word.clone(), forms)
+            })
+            .collect();
+
+        let per_word_candidates: Vec<(String, Vec<String>)> = per_word_forms
+            .par_iter()
+            .map(|(word, forms)| {
+                let mut seen: HashSet<String> = forms.iter().cloned().collect();
+                let mut cands = Vec::new();
+                for f in forms {
+                    let accent_preserving = crate::entry_processor::capitalize_first(f);
+                    if accent_preserving == *f {
+                        // Already starts uppercase (or first char isn't cased).
+                        continue;
+                    }
+                    if seen.insert(accent_preserving.clone()) {
+                        cands.push(accent_preserving.clone());
+                    }
+                    if let Some(accent_dropped) = drop_tonos_from_capital(&accent_preserving)
+                        && seen.insert(accent_dropped.clone())
+                    {
+                        cands.push(accent_dropped);
+                    }
+                }
+                (word.clone(), cands)
+            })
+            .collect();
+
+        let mut claims: HashMap<String, Vec<String>> = HashMap::new();
+        for (word, cands) in &per_word_candidates {
+            for c in cands {
+                claims.entry(c.clone()).or_default().push(word.clone());
+            }
+        }
+
+        let mut winner_for: HashMap<String, String> = HashMap::new();
+        let mut headword_collisions: Vec<String> = Vec::new();
+        let mut contested_resolved = 0usize;
+
+        for (cand, claimants) in &claims {
+            if self.entries.contains_key(cand) {
+                headword_collisions.push(cand.clone());
+                continue;
+            }
+            if claimants.len() == 1 {
+                winner_for.insert(cand.clone(), claimants[0].clone());
+                continue;
+            }
+            contested_resolved += 1;
+            let mut best = claimants[0].clone();
+            let mut best_f = self.frequency.frequency(&best);
+            for w in claimants.iter().skip(1) {
+                let f = self.frequency.frequency(w);
+                if f > best_f || (f == best_f && *w < best) {
+                    best = w.clone();
+                    best_f = f;
+                }
+            }
+            winner_for.insert(cand.clone(), best);
+        }
+
+        let mut result: HashMap<String, Vec<String>> = HashMap::new();
+        let mut total_added = 0usize;
+        for (word, cands) in per_word_candidates {
+            for c in cands {
+                if winner_for.get(&c).map(|w| w == &word).unwrap_or(false) {
+                    result.entry(word.clone()).or_default().push(c);
+                    total_added += 1;
+                }
+            }
+        }
+
+        if !headword_collisions.is_empty() {
+            let mut sample = headword_collisions.clone();
+            sample.sort();
+            let shown: Vec<&str> = sample.iter().take(10).map(|s| s.as_str()).collect();
+            println!(
+                "  Capitalized variants: skipped {} variant(s) colliding with an existing distinct headword (manual review): {}{}",
+                headword_collisions.len(),
+                shown.join(", "),
+                if headword_collisions.len() > 10 { ", ..." } else { "" }
+            );
+        }
+        println!(
+            "  Capitalized variants: added {} variant(s) across {} headword(s) ({} contested resolved by frequency)",
+            total_added,
+            result.len(),
+            contested_resolved
+        );
+
+        self.capitalized_variants = result;
+    }
+
     /// Ranked single-word inflections for a headword, capped at
     /// `max_inflections` and de-duplicated against iforms owned by a
     /// higher-frequency headword. Shared by `entry_variations` (which
@@ -812,6 +975,17 @@ impl<'a> HtmlGenerator<'a> {
         // Feature 2: trailing/leading punctuation variants precomputed by
         // `build_punct_variants`, already collision-resolved.
         if let Some(extra) = self.punct_variants_map.get(word) {
+            let mut seen: HashSet<String> = all_variations.iter().cloned().collect();
+            for v in extra {
+                if seen.insert(v.clone()) {
+                    all_variations.push(v.clone());
+                }
+            }
+        }
+
+        // Explicit capitalized variants precomputed by
+        // `build_capitalized_variants`, already collision-resolved.
+        if let Some(extra) = self.capitalized_variants.get(word) {
             let mut seen: HashSet<String> = all_variations.iter().cloned().collect();
             for v in extra {
                 if seen.insert(v.clone()) {
@@ -1826,6 +2000,7 @@ mod lookup_coverage_tests {
         htmlgen.build_iform_owners();
         htmlgen.build_double_accent_variants();
         htmlgen.build_punct_variants();
+        htmlgen.build_capitalized_variants();
 
         let entries_ref = htmlgen.entries.get(&"χαρτοφύλακας".to_string()).unwrap().clone();
         let variations = htmlgen.entry_variations("χαρτοφύλακας", &entries_ref);
@@ -1846,6 +2021,7 @@ mod lookup_coverage_tests {
         htmlgen.build_iform_owners();
         htmlgen.build_double_accent_variants();
         htmlgen.build_punct_variants();
+        htmlgen.build_capitalized_variants();
 
         let entries_ref = htmlgen.entries.get(&"λέξη".to_string()).unwrap().clone();
         let variations = htmlgen.entry_variations("λέξη", &entries_ref);
@@ -1869,6 +2045,7 @@ mod lookup_coverage_tests {
         htmlgen.build_iform_owners();
         htmlgen.build_double_accent_variants();
         htmlgen.build_punct_variants();
+        htmlgen.build_capitalized_variants();
 
         let entries_ref = htmlgen.entries.get(&"λέξη".to_string()).unwrap().clone();
         let variations = htmlgen.entry_variations("λέξη", &entries_ref);
@@ -1895,6 +2072,7 @@ mod lookup_coverage_tests {
         htmlgen.build_iform_owners();
         htmlgen.build_double_accent_variants();
         htmlgen.build_punct_variants();
+        htmlgen.build_capitalized_variants();
 
         assert!(
             htmlgen.double_accent_variants
@@ -1923,6 +2101,7 @@ mod lookup_coverage_tests {
         htmlgen.build_iform_owners();
         htmlgen.build_double_accent_variants();
         htmlgen.build_punct_variants();
+        htmlgen.build_capitalized_variants();
 
         let owns_from_kala = htmlgen
             .punct_variants_map
@@ -1940,6 +2119,104 @@ mod lookup_coverage_tests {
             "\"καλά,\" must be claimed by exactly one of the two colliding headwords: from_kala={}, from_kalos={}",
             owns_from_kala,
             owns_from_kalos
+        );
+    }
+
+    #[test]
+    fn capitalized_variants_close_indeclinable_gap() {
+        // "όχι" (an interjection) has no Wiktionary `forms` array, so the
+        // old capitalize_first() call inside entry_processor.rs's forms
+        // loop never ran for it. build_capitalized_variants is scoped to
+        // headword + inflections unconditionally, so it must produce a
+        // capitalized variant for a bare headword with zero inflections.
+        let mut entries = EntryMap::new();
+        entries.insert("όχι".to_string(), vec![noun_entry(&[])]);
+
+        let mut htmlgen = HtmlGenerator::new(entries, params(0), None);
+        htmlgen.merge_form_of_into_parents();
+        htmlgen.build_iform_owners();
+        htmlgen.build_double_accent_variants();
+        htmlgen.build_punct_variants();
+        htmlgen.build_capitalized_variants();
+
+        let entries_ref = htmlgen.entries.get(&"όχι".to_string()).unwrap().clone();
+        let variations = htmlgen.entry_variations("όχι", &entries_ref);
+
+        assert!(
+            variations.iter().any(|v| v == "Όχι"),
+            "expected accent-preserving capital 'Όχι', got {:?}",
+            variations
+        );
+        assert!(
+            variations.iter().any(|v| v == "Οχι"),
+            "expected accent-dropped capital 'Οχι', got {:?}",
+            variations
+        );
+    }
+
+    #[test]
+    fn capitalized_variants_skip_accent_drop_when_first_letter_unaccented() {
+        // Consonant-initial words only get one capitalized variant - the
+        // accent-preserving and accent-dropped forms would be identical, so
+        // the second must be skipped rather than emitted as a duplicate.
+        let mut entries = EntryMap::new();
+        entries.insert("μα".to_string(), vec![noun_entry(&[])]);
+
+        let mut htmlgen = HtmlGenerator::new(entries, params(0), None);
+        htmlgen.merge_form_of_into_parents();
+        htmlgen.build_iform_owners();
+        htmlgen.build_double_accent_variants();
+        htmlgen.build_punct_variants();
+        htmlgen.build_capitalized_variants();
+
+        let entries_ref = htmlgen.entries.get(&"μα".to_string()).unwrap().clone();
+        let variations = htmlgen.entry_variations("μα", &entries_ref);
+
+        let cap_count = variations.iter().filter(|v| v.as_str() == "Μα").count();
+        assert_eq!(cap_count, 1, "expected exactly one 'Μα' variant, got {:?}", variations);
+    }
+
+    #[test]
+    fn capitalized_variants_cover_inflections_not_just_headword() {
+        let mut entries = EntryMap::new();
+        entries.insert(
+            "δείχνω".to_string(),
+            vec![noun_entry(&["έδειχναν"])],
+        );
+
+        let mut htmlgen = HtmlGenerator::new(entries, params(0), None);
+        htmlgen.merge_form_of_into_parents();
+        htmlgen.build_iform_owners();
+        htmlgen.build_double_accent_variants();
+        htmlgen.build_punct_variants();
+        htmlgen.build_capitalized_variants();
+
+        let entries_ref = htmlgen.entries.get(&"δείχνω".to_string()).unwrap().clone();
+        let variations = htmlgen.entry_variations("δείχνω", &entries_ref);
+
+        assert!(variations.iter().any(|v| v == "Έδειχναν"), "got {:?}", variations);
+        assert!(variations.iter().any(|v| v == "Εδειχναν"), "got {:?}", variations);
+    }
+
+    #[test]
+    fn capitalized_variants_skip_collision_with_real_distinct_headword() {
+        let mut entries = EntryMap::new();
+        entries.insert("όχι".to_string(), vec![noun_entry(&[])]);
+        entries.insert("Όχι".to_string(), vec![noun_entry(&[])]);
+
+        let mut htmlgen = HtmlGenerator::new(entries, params(0), None);
+        htmlgen.merge_form_of_into_parents();
+        htmlgen.build_iform_owners();
+        htmlgen.build_double_accent_variants();
+        htmlgen.build_punct_variants();
+        htmlgen.build_capitalized_variants();
+
+        assert!(
+            htmlgen.capitalized_variants
+                .get("όχι")
+                .map(|v| !v.contains(&"Όχι".to_string()))
+                .unwrap_or(true),
+            "capitalized variant colliding with a real distinct headword must be skipped"
         );
     }
 }

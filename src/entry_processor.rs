@@ -322,10 +322,6 @@ pub fn collect_inflections_from(entry: &Value, word: &str, source_lang: &str) ->
                 if fw == word { continue; }
                 for expanded in expand_parentheses(fw) {
                     add(&expanded, &mut inflections, &mut inflection_set);
-                    let capitalized = capitalize_first(&expanded);
-                    if capitalized != expanded {
-                        add(&capitalized, &mut inflections, &mut inflection_set);
-                    }
                     let lowered = lower_first(&expanded);
                     if lowered != expanded {
                         add(&lowered, &mut inflections, &mut inflection_set);
@@ -339,10 +335,6 @@ pub fn collect_inflections_from(entry: &Value, word: &str, source_lang: &str) ->
                 if s.contains(' ') { continue; }
                 for expanded in expand_parentheses(s) {
                     add(&expanded, &mut inflections, &mut inflection_set);
-                    let capitalized = capitalize_first(&expanded);
-                    if capitalized != expanded {
-                        add(&capitalized, &mut inflections, &mut inflection_set);
-                    }
                     let lowered = lower_first(&expanded);
                     if lowered != expanded {
                         add(&lowered, &mut inflections, &mut inflection_set);
