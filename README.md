@@ -30,7 +30,7 @@ Lemma ships as a single unified edition with every feature the generator support
 
 ### Setting as Default Greek Dictionary
 
-On your Kindle, go to **Settings → Language & Dictionaries → Dictionaries → Greek** and pick **"Lemma Greek-English (v3)"** (or **"Lemma Greek-Greek (v3)"** for a `--source el` build). From then on, long-pressing any Greek word in any book will use Lemma for the lookup popup.
+On your Kindle, go to **Settings → Language & Dictionaries → Dictionaries → Greek** and pick **"Lemma Greek-English (v4)"** (or **"Lemma Greek-Greek (v4)"** for a `--source el` build). From then on, long-pressing any Greek word in any book will use Lemma for the lookup popup.
 
 (On older Kindles the path may be slightly different, e.g. *Home → Menu → Settings → Device Options → Language and Dictionaries → Dictionaries → Greek*.)
 

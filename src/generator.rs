@@ -47,7 +47,7 @@ pub fn run(opts: GeneratorOptions) -> Result<(), Box<dyn std::error::Error>> {
     }
     let default_edition_preview = {
         let direction = if opts.source_lang == "en" { "Greek-English" } else { "Greek-Greek" };
-        format!("Lemma {} (v3)", direction)
+        format!("Lemma {} (v4)", direction)
     };
     let edition_preview = front_matter.get("edition_name")
         .and_then(|v| v.as_str())

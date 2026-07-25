@@ -1437,7 +1437,7 @@ impl<'a> HtmlGenerator<'a> {
         // which reads this from <dc:title> / the "dictionary-name" meta
         // below - both driven by this string.
         let direction = if self.params.source_lang == "en" { "Greek-English" } else { "Greek-Greek" };
-        format!("Lemma {} (v3)", direction)
+        format!("Lemma {} (v4)", direction)
     }
 
     fn create_opf_file(&mut self) -> std::io::Result<()> {
