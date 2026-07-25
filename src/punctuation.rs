@@ -36,6 +36,35 @@ pub fn variants_for(form: &str) -> Vec<String> {
     out
 }
 
+/// Closing quote/bracket marks that, per Greek typographic convention, sit
+/// immediately before the enclosing sentence's own trailing punctuation
+/// with no space - e.g. the guillemet in "παλιόπαιδο»," (the quotation
+/// closes, and the sentence's comma continues right after it). Deliberately
+/// excludes the straight apostrophe `'`, which in this dictionary's data
+/// much more commonly marks an elided word form than a closing quote, so
+/// stacking it here would generate mostly-noise combinations.
+pub const CLOSING: &[&str] = &["\u{00BB}", ")", "\""];
+
+/// Sentence-level marks that commonly follow a closing quote/bracket mark
+/// with no space: comma, period, ano teleia, Greek question mark, colon.
+pub const SENTENCE: &[&str] = &[",", ".", "\u{0387}", "\u{037E}", ":"];
+
+/// All `{form}{closing}{sentence}` two-mark trailing combinations for one
+/// form (e.g. "παλιόπαιδο»," "παλιόπαιδο")." ...). Kept as a separate
+/// function from `variants_for` rather than folded in automatically: the
+/// combination space (`CLOSING.len() * SENTENCE.len()` per form) grows
+/// faster than the single-mark list, so callers decide explicitly whether
+/// and how to scope it instead of getting it for free.
+pub fn double_trailing_variants_for(form: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(CLOSING.len() * SENTENCE.len());
+    for c in CLOSING {
+        for s in SENTENCE {
+            out.push(format!("{}{}{}", form, c, s));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +92,23 @@ mod tests {
     fn variant_count_matches_mark_lists() {
         let v = variants_for("λέξη");
         assert_eq!(v.len(), TRAILING.len() + LEADING.len());
+    }
+
+    #[test]
+    fn generates_stacked_guillemet_comma() {
+        let v = double_trailing_variants_for("παλιόπαιδο");
+        assert!(v.contains(&"παλιόπαιδο»,".to_string()));
+    }
+
+    #[test]
+    fn double_trailing_count_matches_mark_lists() {
+        let v = double_trailing_variants_for("λέξη");
+        assert_eq!(v.len(), CLOSING.len() * SENTENCE.len());
+    }
+
+    #[test]
+    fn double_trailing_excludes_apostrophe_as_closing_mark() {
+        let v = double_trailing_variants_for("λέξη");
+        assert!(!v.iter().any(|s| s.starts_with("λέξη',") || s.starts_with("λέξη'.")));
     }
 }

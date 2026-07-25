@@ -45,10 +45,14 @@ pub fn run(opts: GeneratorOptions) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(p) = &opts.front_matter_path {
         println!("  Front matter: {}", p.display());
     }
+    let default_edition_preview = {
+        let direction = if opts.source_lang == "en" { "Greek-English" } else { "Greek-Greek" };
+        format!("Lemma {} (v3)", direction)
+    };
     let edition_preview = front_matter.get("edition_name")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| "Lemma Greek Dictionary".to_string());
+        .unwrap_or(default_edition_preview);
     println!("  Edition: {}", edition_preview);
 
     // Download

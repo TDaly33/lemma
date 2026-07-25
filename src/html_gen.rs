@@ -633,6 +633,15 @@ impl<'a> HtmlGenerator<'a> {
                             cands.push(v);
                         }
                     }
+                    // Two-mark trailing combinations (closing quote/bracket
+                    // immediately followed by a sentence-level mark, e.g.
+                    // "παλιόπαιδο»,") - same scope as the single-mark
+                    // variants above, no separate cap.
+                    for v in crate::punctuation::double_trailing_variants_for(form) {
+                        if seen.insert(v.clone()) {
+                            cands.push(v);
+                        }
+                    }
                 }
                 (word.clone(), cands)
             })
@@ -1249,7 +1258,12 @@ impl<'a> HtmlGenerator<'a> {
     }
 
     fn default_edition_name(&self) -> String {
-        "Lemma Greek Dictionary".to_string()
+        // Distinguishes this fork's builds from the upstream open-greek/lemma
+        // release in Kindle's Settings -> Language & Dictionaries picker,
+        // which reads this from <dc:title> / the "dictionary-name" meta
+        // below - both driven by this string.
+        let direction = if self.params.source_lang == "en" { "Greek-English" } else { "Greek-Greek" };
+        format!("Lemma {} (v3)", direction)
     }
 
     fn create_opf_file(&mut self) -> std::io::Result<()> {

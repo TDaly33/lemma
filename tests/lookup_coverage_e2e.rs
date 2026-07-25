@@ -42,6 +42,14 @@ const PUNCT_COLLISION_FIXTURE: &str = r#"{"word": "καλά", "lang_code": "el",
 {"word": "καλός", "lang_code": "el", "pos": "adj", "senses": [{"glosses": ["good"]}], "forms": [{"form": "καλά", "tags": ["neuter", "plural"]}]}
 "#;
 
+// Double-mark fixture: a single headword, used to reproduce the reported
+// gap - Greek quotation convention glues a closing guillemet directly to
+// the sentence's own trailing punctuation with no space, e.g.
+// "παλιόπαιδο»," (word + » + , with nothing between). Single-mark-only
+// punctuation variants never produce this string.
+const DOUBLE_MARK_FIXTURE: &str = r#"{"word": "παλιόπαιδο", "lang_code": "el", "pos": "noun", "senses": [{"glosses": ["brat"]}], "forms": []}
+"#;
+
 struct Fixture {
     jsonl_path: PathBuf,
     output_dir: PathBuf,
@@ -203,6 +211,22 @@ fn punctuation_variants_appear_when_enabled_and_not_when_disabled() {
 
     let (_fixture2, html_off) = build_fixture_dictionary(FIXTURE, 0);
     assert!(!html_off.contains("<idx:iform value=\"λέξη,\""));
+}
+
+#[test]
+fn closing_guillemet_plus_comma_resolves_as_a_stacked_trailing_variant() {
+    // Reported gap: Greek quotation convention glues a closing guillemet
+    // directly to the sentence's own trailing punctuation with no space -
+    // "παλιόπαιδο»," as it would appear in running text (»Χαρτοφύλακα...
+    // παλιόπαιδο», είπε.) Single-mark-only punctuation variants never
+    // produce this string, so the lookup fails even though the headword is
+    // indexed. This must resolve once two-mark trailing combinations are
+    // generated.
+    let (_fixture, html) = build_fixture_dictionary(DOUBLE_MARK_FIXTURE, 1);
+    assert!(
+        html.contains("<idx:iform value=\"παλιόπαιδο»,\""),
+        "expected the stacked guillemet+comma variant παλιόπαιδο», as an iform"
+    );
 }
 
 #[test]
