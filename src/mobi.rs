@@ -43,7 +43,7 @@ impl<'a> MobiGenerator<'a> {
             true,  // kindle_limits (default ON for dictionaries)
             false, // self_check
             false, // kindlegen_parity (comic-path only; ignored for dict builds)
-            false, // strict_accents (off = fold diacritics at lookup, like kindlegen)
+            true, // strict_accents (TEMP TEST: verifying capitalized-routing hypothesis, not yet a decision)
         );
 
         match result {
